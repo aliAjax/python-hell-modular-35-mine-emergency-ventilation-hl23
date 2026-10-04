@@ -80,6 +80,12 @@ def _validate_offline(data):
         datetime.fromisoformat(str(data.get("recorded_at")).replace("Z", "+00:00"))
     except ValueError:
         raise ValidationError("recorded_at must be ISO-8601")
+    payload = data["payload"]
+    record_type = payload.get("type")
+    if record_type == "refuge_occupancy":
+        _require(payload, ("refuge_id", "worker_id"))
+    elif record_type == "ventilation_restore":
+        _require(payload, ("ventilation_id",))
 
 
 def _sensor_alarm(actor, entity, data, lookup):
@@ -102,7 +108,42 @@ def _close_incident(actor, entity, data, lookup):
         raise ConflictError("cannot close incident while tasks remain active")
     if [v for v in _all(lookup, "ventilation") if v["status"] != "running"]:
         raise ConflictError("cannot close incident until ventilation is restored")
+    if [r for r in _all(lookup, "offline_record") if r["status"] == "conflict"]:
+        raise ConflictError("cannot close incident while offline record conflicts are unresolved")
     return {"closed_by": actor.user_id}
+
+
+def _update_reading(actor, entity, data, lookup):
+    gas = _number(data.get("gas_ppm"), "gas_ppm")
+    if gas < 0:
+        raise ValidationError("gas readings must be positive")
+    threshold = _number(entity["data"].get("threshold_ppm"), "threshold_ppm")
+    severity = "alarm" if gas >= threshold * 1.5 else "warning" if gas >= threshold else "normal"
+    return {"gas_ppm": gas, "severity": severity}
+
+
+def _confirm_restore(actor, entity, data, lookup):
+    payload = entity["data"].get("payload") or {}
+    if payload.get("type") != "ventilation_restore":
+        raise ValidationError("only ventilation restore records can be confirmed")
+    return {}
+
+
+def _resolve_apply(actor, entity, data, lookup):
+    payload = entity["data"].get("payload") or {}
+    if payload.get("type") != "refuge_occupancy":
+        raise ValidationError("only refuge occupancy records can be applied")
+    refuge = _find_one(lookup, "refuge", "id", payload.get("refuge_id"))
+    if not refuge:
+        raise ConflictError("refuge not found: " + str(payload.get("refuge_id")))
+    if refuge["status"] not in ("available", "occupied"):
+        raise ConflictError("refuge is not available for occupancy")
+    occupants = refuge["data"].get("occupants") or []
+    worker_id = payload.get("worker_id")
+    capacity = _number(refuge["data"].get("capacity"), "capacity")
+    if worker_id not in occupants and len(occupants) + 1 > capacity:
+        raise ConflictError("refuge occupancy would exceed capacity")
+    return {}
 
 
 class RuleEngine:
@@ -131,6 +172,7 @@ class RuleEngine:
             "clear": (("warning", "alarm"), "normal"),
             "mark_faulty": (("normal", "warning", "alarm"), "faulty"),
             "verify_misread": (("faulty",), "normal"),
+            "update_reading": (("normal", "warning", "alarm"), None),
         },
         "ventilation": {
             "degrade": (("running",), "degraded"),
@@ -162,6 +204,11 @@ class RuleEngine:
             "complete": (("in_progress",), "completed"),
             "cancel": (("proposed", "assigned", "in_progress"), "cancelled"),
         },
+        "offline_record": {
+            "confirm": (("stale",), "pending"),
+            "resolve_apply": (("conflict",), "applied"),
+            "resolve_discard": (("conflict",), "superseded"),
+        },
     }
     CREATE_REQUIRED = {
         "worker": ("name", "location_code", "team"),
@@ -176,6 +223,7 @@ class RuleEngine:
     ACTION_REQUIRED = {
         ("worker", "rescue"): ("incident_id",),
         ("sensor", "mark_faulty"): ("reason",),
+        ("sensor", "update_reading"): ("gas_ppm",),
         ("ventilation", "restore"): ("tested_at",),
         ("ventilation", "degrade"): ("reason",),
         ("incident", "close"): ("summary",),
@@ -201,6 +249,7 @@ class RuleEngine:
         "deactivate": ("admin", "safety"),
         "raise_warning": ("admin", "field", "safety"),
         "raise_alarm": ("admin", "field", "safety"),
+        "update_reading": ("admin", "field", "safety"),
         "clear": ("admin", "safety"),
         "mark_faulty": ("admin", "safety"),
         "verify_misread": ("admin", "safety"),
@@ -223,6 +272,9 @@ class RuleEngine:
         "accept": ("admin", "field", "dispatcher"),
         "complete": ("admin", "field", "dispatcher"),
         "cancel": ("admin", "dispatcher", "safety"),
+        "confirm": ("admin", "field", "safety"),
+        "resolve_apply": ("admin", "safety"),
+        "resolve_discard": ("admin", "safety"),
     }
     CUSTOM_CREATE = {
         "worker": lambda a, d, l: _validate_worker(d),
@@ -236,8 +288,11 @@ class RuleEngine:
     }
     CUSTOM_TRANSITIONS = {
         ("sensor", "raise_alarm"): _sensor_alarm,
+        ("sensor", "update_reading"): _update_reading,
         ("incident", "close"): _close_incident,
         ("task", "complete"): _complete_task,
+        ("offline_record", "confirm"): _confirm_restore,
+        ("offline_record", "resolve_apply"): _resolve_apply,
     }
 
     def normalize_kind(self, kind):
@@ -276,4 +331,6 @@ class RuleEngine:
         patch = dict(data)
         if extra:
             patch.update(extra)
+        if next_status is None:
+            next_status = entity["status"]
         return next_status, patch

@@ -42,8 +42,12 @@ curl http://127.0.0.1:8335/health
 ## 规则重点
 
 - 活跃任务按 `dedupe_key` 防止重复派工。
-- 气体读数按阈值计算`severity`。
-- 事件关闭前必须没有失联或已定位人员、没有活跃任务，并且所有通风设备恢复运行。
+- 气体读数按阈值计算`severity`；`update_reading`动作更新读数并重算`severity`。
+- 事件关闭前必须没有失联或已定位人员、没有活跃任务、所有通风设备恢复运行，并且没有未解决的离线记录冲突。
+- 离线记录合并先核对人员和设备，不会直接改正式状态：
+  - `refuge_occupancy`：人员或硐室对不上、硐室不可用、超出核定容量的占用会被`rejected`；同一人员的两条记录不一致时两版都保留并标记`conflict`，用`resolve_apply`/`resolve_discard`裁决后落地。
+  - `ventilation_restore`：气体读数高于阈值时保持`pending`不落地；气体读数一旦变化，未处理的申请作废为`stale`，需现场`confirm`确认后才会恢复通风机。
+  - `source_id + record_id`相同的重复合并幂等返回原记录，占用按人员去重，不会重复占用。
 
 ## 测试
 
