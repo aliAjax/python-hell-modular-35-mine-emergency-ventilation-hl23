@@ -73,6 +73,9 @@ def _validate_task(data, lookup):
             raise ConflictError("active task already exists for dedupe_key: " + str(key))
 
 
+_OFFLINE_PAYLOAD_TYPES = ("occupancy", "recovery", "recovery_confirm", "gas", "conflict_resolve")
+
+
 def _validate_offline(data):
     if not isinstance(data.get("payload"), dict):
         raise ValidationError("offline payload must be an object")
@@ -80,6 +83,23 @@ def _validate_offline(data):
         datetime.fromisoformat(str(data.get("recorded_at")).replace("Z", "+00:00"))
     except ValueError:
         raise ValidationError("recorded_at must be ISO-8601")
+    payload = data["payload"]
+    ptype = payload.get("type")
+    if ptype not in _OFFLINE_PAYLOAD_TYPES:
+        raise ValidationError("unknown offline payload type: " + str(ptype))
+    if ptype == "occupancy":
+        _require(payload, ("person_id", "refuge_id", "action"))
+        if payload["action"] not in ("occupy", "release"):
+            raise ValidationError("occupancy action must be occupy or release")
+    elif ptype == "recovery":
+        _require(payload, ("ventilation_id",))
+    elif ptype == "recovery_confirm":
+        _require(payload, ("ventilation_id",))
+    elif ptype == "gas":
+        _require(payload, ("value",))
+        _number(payload.get("value"), "gas value")
+    elif ptype == "conflict_resolve":
+        _require(payload, ("person_id",))
 
 
 def _sensor_alarm(actor, entity, data, lookup):
@@ -102,6 +122,9 @@ def _close_incident(actor, entity, data, lookup):
         raise ConflictError("cannot close incident while tasks remain active")
     if [v for v in _all(lookup, "ventilation") if v["status"] != "running"]:
         raise ConflictError("cannot close incident until ventilation is restored")
+    unresolved = [r for r in _all(lookup, "offline_record") if r["status"] == "conflict"]
+    if unresolved:
+        raise ConflictError("cannot close incident while offline record conflicts are unresolved")
     return {"closed_by": actor.user_id}
 
 
